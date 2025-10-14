@@ -1,6 +1,15 @@
-use std::{env::var_os, ffi::CStr, io::Cursor, os::fd::AsFd as _, path::PathBuf, time::Duration};
+use std::{
+    env,
+    ffi::CStr,
+    fs::{self, File},
+    io::{BufReader, Cursor},
+    os::fd::AsFd as _,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Context as _;
+use bytes::Bytes;
 use image::{DynamicImage, GenericImageView, codecs::jpeg::JpegDecoder};
 use rustix::{
     fs::{Mode, OFlags},
@@ -29,35 +38,56 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
-fn runtime_dir() -> PathBuf {
-    var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let uid = rustix::process::getuid();
-            PathBuf::from(format!("/run/user/{uid}"))
-        })
-}
+const APP_NAME: &str = "papier";
 
 struct Client {
+    cache_path: PathBuf,
     globals: Globals,
     window: Option<Window>,
-    pointer: Option<WlPointer>,
     cursor_shape_device: Option<WpCursorShapeDeviceV1>,
-    cache_path: PathBuf,
-    cache_size: [u32; 2],
+    source: Option<DynamicImage>,
+}
+
+fn cache_path() -> PathBuf {
+    env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = env::var_os("HOME").unwrap();
+            PathBuf::from(home).join(".cache")
+        })
+        .join(APP_NAME)
+        .join("cache")
+}
+
+fn open_cache(path: impl AsRef<Path>) -> anyhow::Result<DynamicImage> {
+    let reader = BufReader::new(File::open(path)?);
+    let decoder = JpegDecoder::new(reader)?;
+    let img = DynamicImage::from_decoder(decoder)?;
+    Ok(img)
 }
 
 impl Client {
     fn new() -> Self {
-        let cache_dir = runtime_dir().join("papier");
+        let cache_path = cache_path();
+        let source = open_cache(&cache_path).ok();
         Self {
+            cache_path,
             globals: Globals::default(),
             window: None,
-            pointer: None,
             cursor_shape_device: None,
-            cache_path: cache_dir,
-            cache_size: [0; 2],
+            source,
         }
+    }
+    fn scale(&mut self, scale: u32, qh: &QueueHandle<Self>) {
+        let window = self.window.as_mut().unwrap();
+        if scale == window.pixmap.scale {
+            return;
+        }
+        window.surface.set_buffer_scale(scale as _);
+        window.pixmap.unmap();
+        window.pixmap.scale = scale;
+        window.allocate_buffer(self.globals.shm(), qh);
+        self.reload();
     }
 }
 
@@ -73,8 +103,15 @@ impl Window {
         qh: &QueueHandle<Client>,
     ) -> Self {
         let surface = compositor.create_surface(qh, ());
-        let layer_surface =
-            layer_shell.get_layer_surface(&surface, None, Layer::Bottom, "ice_bar".into(), qh, ());
+        let layer_surface = layer_shell.get_layer_surface(
+            &surface,
+            None,
+            Layer::Background,
+            APP_NAME.into(),
+            qh,
+            (),
+        );
+        layer_surface.set_exclusive_zone(-1);
         layer_surface.set_anchor(Anchor::all());
         surface.commit();
 
@@ -88,15 +125,6 @@ impl Window {
         self.pixmap.unmap();
         self.pixmap.width = width;
         self.pixmap.height = height;
-        self.allocate_buffer(shm, qh);
-    }
-    fn scale(&mut self, scale: u32, shm: &WlShm, qh: &QueueHandle<Client>) {
-        self.surface.set_buffer_scale(scale as _);
-        self.pixmap.unmap();
-        if scale == self.pixmap.scale {
-            return;
-        }
-        self.pixmap.scale = scale;
         self.allocate_buffer(shm, qh);
     }
     fn allocate_buffer(&mut self, shm: &WlShm, qh: &QueueHandle<Client>) {
@@ -139,16 +167,22 @@ impl Window {
         self.buffer.replace(buffer).as_ref().map(WlBuffer::destroy);
     }
 
-    fn render(&self, source: Pixmap) {
-        for y in 0..self.pixmap.buffer_height() {
-            for x in 0..self.pixmap.buffer_width() {
-                let dest = self.pixmap.pixel_mut(x, y);
-                let x = (x * self.pixmap.buffer_width() / source.width).min(source.width - 1);
-                let y = (y * self.pixmap.buffer_height() / source.height).min(source.height - 1);
-                *dest = source.pixel(x, y);
+    fn render(&self, source: &Option<DynamicImage>) {
+        if let Some(source) = source {
+            for y in 0..self.pixmap.buffer_height() {
+                for x in 0..self.pixmap.buffer_width() {
+                    let dest = self.pixmap.pixel_mut(x, y);
+                    let x = x * source.width() / self.pixmap.buffer_width();
+                    let y = y * source.height() / self.pixmap.buffer_height();
+                    let [r, g, b, _] = source.get_pixel(x, y).0.map(|x| x as u32);
+                    *dest = (r << 16) | (g << 8) | b;
+                }
+            }
+        } else {
+            for pixel in self.pixmap.pixels_mut() {
+                *pixel = 0x93a7c9;
             }
         }
-        source.unmap();
         self.surface
             .attach(Some(self.buffer.as_ref().unwrap()), 0, 0);
         self.surface.damage_buffer(
@@ -161,86 +195,57 @@ impl Window {
     }
 }
 
-impl Client {
-    async fn fetch(&mut self) -> anyhow::Result<Pixmap> {
-        let bytes = reqwest::get("https://bing.biturl.top?format=image&resolution=UHD&mkt=random")
-            .await
-            .context("Failed to reload image")?
-            .bytes()
-            .await
-            .context("Failed to read image bytes")?;
-        let reader = Cursor::new(bytes);
-        let decoder = JpegDecoder::new(reader).context("Failed to create decoder")?;
-        let img = DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
+async fn try_fetch() -> anyhow::Result<Bytes> {
+    reqwest::get("https://bing.biturl.top?format=image&resolution=UHD&mkt=random")
+        .await
+        .context("Failed to reload image")?
+        .bytes()
+        .await
+        .context("Failed to read image bytes")
+}
 
-        self.cache_size = [img.width(), img.height()];
-        let len = img.width() as usize * img.height() as usize * 4;
-        let fd = rustix::fs::open(
-            &self.cache_path,
-            OFlags::CREATE | OFlags::RDWR,
-            Mode::from_raw_mode(0o600),
-        )?;
-        rustix::fs::ftruncate(&fd, len as _)?;
-        let data = unsafe {
-            rustix::mm::mmap(
-                std::ptr::null_mut(),
-                len,
-                ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::PRIVATE,
-                &fd,
-                0,
-            )?
-        };
-        let data = NonNull::new(data as _);
-        let pixmap = Pixmap {
-            width: img.width(),
-            height: img.height(),
-            scale: 1,
-            data,
-        };
-        for y in 0..img.height() {
-            for x in 0..img.width() {
-                let [r, g, b, _] = img.get_pixel(x, y).0.map(|x| x as u32);
-                *pixmap.pixel_mut(x, y) = (r << 16) | (g << 8) | b;
+fn decode_image(bytes: Bytes) -> anyhow::Result<DynamicImage> {
+    let reader = Cursor::new(bytes);
+    let decoder = JpegDecoder::new(reader).context("Failed to create decoder")?;
+    let img = DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
+    Ok(img)
+}
+
+impl Client {
+    fn fetch(&self, retry: usize) -> impl Future<Output = anyhow::Result<DynamicImage>> {
+        Box::pin(async move {
+            if retry == 0 {
+                anyhow::bail!("failed to fetch image");
             }
-        }
-        rustix::fs::fsync(&fd)?;
-        Ok(pixmap)
-    }
-    fn do_reload(&self) -> anyhow::Result<()> {
-        let fd = rustix::fs::open(&self.cache_path, OFlags::RDONLY, Mode::from_raw_mode(0o600))?;
-        let [width, height] = self.cache_size;
-        let len = width as usize * height as usize * 4;
-        rustix::fs::ftruncate(&fd, len as _)?;
-        let data = unsafe {
-            rustix::mm::mmap(
-                std::ptr::null_mut(),
-                len,
-                ProtFlags::READ,
-                MapFlags::PRIVATE,
-                &fd,
-                0,
-            )?
-        };
-        let data = NonNull::new(data as _);
-        let pixmap = Pixmap {
-            width,
-            height,
-            scale: 1,
-            data,
-        };
-        self.window.as_ref().unwrap().render(pixmap);
-        Ok(())
+            match try_fetch().await {
+                Ok(bytes) => match decode_image(bytes.clone()) {
+                    Ok(img) => {
+                        fs::create_dir_all(self.cache_path.parent().unwrap())
+                            .and_then(|_| fs::write(&self.cache_path, bytes))
+                            .inspect_err(|e| log::warn!("failed to cache image: {e:?}"))
+                            .ok();
+                        Ok(img)
+                    }
+                    Err(_) => self.fetch(retry - 1).await,
+                },
+                Err(e) => {
+                    log::warn!("{e:?}");
+                    tokio::time::sleep(Duration::new(1, 0)).await;
+                    self.fetch(retry - 1).await
+                }
+            }
+        })
     }
     fn reload(&self) {
-        if let Err(err) = self.do_reload() {
-            log::error!("{:?}", err);
-        }
+        self.window.as_ref().unwrap().render(&self.source);
     }
     async fn tick(&mut self) {
-        match self.fetch().await {
-            Ok(image) => self.window.as_ref().unwrap().render(image),
-            Err(err) => log::error!("{:?}", err),
+        match self.fetch(10).await {
+            Ok(image) => {
+                self.source = Some(image);
+                self.reload();
+            }
+            Err(err) => log::error!("{err:?}"),
         };
     }
     fn run(&mut self) -> impl Future<Output = ()> {
@@ -250,15 +255,6 @@ impl Client {
         let display = connection.display();
         display.get_registry(&qh, ());
         queue.roundtrip(self).unwrap();
-
-        if let Some(pointer) = self.pointer.as_ref() {
-            self.cursor_shape_device = Some(self.globals.cursor_shaper_manager().get_pointer(
-                pointer,
-                &qh,
-                (),
-            ));
-            self.globals.cursor_shaper_manager().destroy();
-        }
 
         self.window = Some(Window::new(
             self.globals.compositor(),
@@ -383,12 +379,7 @@ impl Dispatch<WlSurface, ()> for Client {
     ) {
         match event {
             wl_surface::Event::PreferredBufferScale { factor } => {
-                client
-                    .window
-                    .as_mut()
-                    .unwrap()
-                    .scale(factor as _, client.globals.shm(), qh);
-                client.reload();
+                client.scale(factor as _, qh);
             }
             _ => {}
         }
@@ -409,8 +400,16 @@ impl Dispatch<WlSeat, ()> for Client {
                 if let WEnum::Value(capabilities) = capabilities
                     && capabilities.contains(Capability::Pointer)
                 {
-                    client.pointer = Some(seat.get_pointer(qh, ()));
-                    seat.release();
+                    let pointer = seat.get_pointer(qh, ());
+
+                    client.cursor_shape_device = Some(
+                        client
+                            .globals
+                            .cursor_shaper_manager()
+                            .get_pointer(&pointer, &qh, ()),
+                    );
+                    client.globals.cursor_shaper_manager().destroy();
+                    // seat.release();
                 }
             }
             _ => {}
@@ -433,9 +432,9 @@ impl Dispatch<WlPointer, ()> for Client {
                     .cursor_shape_device
                     .as_ref()
                     .unwrap()
-                    .set_shape(serial, Shape::Pointer);
+                    .set_shape(serial, Shape::Default);
             }
-            _ => todo!(),
+            _ => {}
         }
     }
 }
@@ -500,7 +499,7 @@ use_globals! {
 
 use std::ptr::NonNull;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Pixmap {
     width: u32,
     height: u32,
@@ -532,16 +531,11 @@ impl Pixmap {
     fn byte_size(&self) -> u32 {
         self.buffer_stride() * self.buffer_height()
     }
-    pub fn data(&self) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(self.data.unwrap().as_ptr() as _, self.byte_size() as _)
-        }
-    }
     fn pixels_mut(&self) -> &mut [u32] {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.data.unwrap().as_ptr() as _,
-                (self.width * self.height * self.scale * self.scale) as _,
+                (self.buffer_width() * self.buffer_height()) as _,
             )
         }
     }
@@ -559,6 +553,9 @@ impl Pixmap {
 }
 
 fn main() {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .init();
     let mut client = Client::new();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
