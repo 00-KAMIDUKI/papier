@@ -16,7 +16,13 @@ use rustix::{
     fs::{Mode, OFlags},
     mm::{MapFlags, ProtFlags},
 };
-use tokio::{io::unix::AsyncFd, sync::Mutex};
+use tokio::{
+    io::unix::AsyncFd,
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
+};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
     protocol::{
@@ -48,7 +54,8 @@ struct Client {
     globals: Globals,
     window: Option<Window>,
     cursor_shape_device: Option<WpCursorShapeDeviceV1>,
-    source: Option<DynamicImage>,
+    source: Arc<Mutex<Option<DynamicImage>>>,
+    release_source: Sender<()>,
 }
 
 fn cache_path() -> PathBuf {
@@ -62,23 +69,16 @@ fn cache_path() -> PathBuf {
         .join("cache")
 }
 
-fn open_cache(path: impl AsRef<Path>) -> anyhow::Result<DynamicImage> {
-    let reader = BufReader::new(File::open(path)?);
-    let decoder = JpegDecoder::new(reader)?;
-    let img = DynamicImage::from_decoder(decoder)?;
-    Ok(img)
-}
-
 impl Client {
-    fn new() -> Self {
+    fn new(release_source: Sender<()>) -> Self {
         let cache_path = cache_path();
-        let source = open_cache(&cache_path).ok();
         Self {
             cache_path: Arc::new(cache_path),
             globals: Globals::default(),
             window: None,
             cursor_shape_device: None,
-            source,
+            source: Default::default(),
+            release_source,
         }
     }
     fn scale(&mut self, scale: u32, qh: &QueueHandle<Self>) {
@@ -101,7 +101,7 @@ impl Client {
 struct Window {
     surface: WlSurface,
     pixmap: Arc<Mutex<Pixmap>>,
-    buffer: Option<WlBuffer>,
+    buffer: Arc<Mutex<Option<WlBuffer>>>,
 }
 impl Window {
     fn new(
@@ -125,7 +125,7 @@ impl Window {
         Window {
             surface,
             pixmap: Default::default(),
-            buffer: None,
+            buffer: Default::default(),
         }
     }
     fn configure(&mut self, width: u32, height: u32, shm: &WlShm, qh: &QueueHandle<Client>) {
@@ -174,7 +174,12 @@ impl Window {
         pool.destroy();
 
         pixmap.data = data;
-        self.buffer.replace(buffer).as_ref().map(WlBuffer::destroy);
+        self.buffer
+            .try_lock()
+            .unwrap()
+            .replace(buffer)
+            .as_ref()
+            .map(WlBuffer::destroy);
     }
 
     fn render(&self, source: &Option<DynamicImage>) {
@@ -198,8 +203,11 @@ impl Window {
             }
             [width, height].map(|x| x as _)
         };
-        self.surface
-            .attach(Some(self.buffer.as_ref().unwrap()), 0, 0);
+        self.surface.attach(
+            Some(self.buffer.try_lock().unwrap().as_ref().unwrap()),
+            0,
+            0,
+        );
         self.surface.damage_buffer(0, 0, width, height);
         self.surface.commit();
     }
@@ -251,19 +259,36 @@ fn fetch(
 }
 
 impl Client {
-    fn reload(&self) {
-        self.window.as_ref().unwrap().render(&self.source);
+    fn load_cache(&mut self) -> anyhow::Result<()> {
+        if self.source.try_lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let reader = BufReader::new(File::open(self.cache_path.as_ref())?);
+        let decoder = JpegDecoder::new(reader)?;
+        let img = DynamicImage::from_decoder(decoder)?;
+        *self.source.try_lock().unwrap() = Some(img);
+        Ok(())
     }
-    async fn tick(&mut self) {
+    fn reload(&mut self) {
+        let loaded = self.load_cache().ok();
+        self.window
+            .as_ref()
+            .unwrap()
+            .render(&&self.source.try_lock().unwrap());
+        if loaded.is_some() {
+            self.release_source.try_send(()).ok();
+        }
+    }
+    async fn on_tick(&mut self) {
         match fetch(self.cache_path.as_ref(), 10).await {
             Ok(image) => {
-                self.source = Some(image);
+                *self.source.lock().await = Some(image);
                 self.reload();
             }
             Err(err) => log::error!("{err:?}"),
         };
     }
-    fn run(mut self) -> impl Future<Output = ()> {
+    fn run(mut self, mut release_source_msg: Receiver<()>) -> impl Future<Output = ()> {
         let connection = Connection::connect_to_env().unwrap();
         let mut queue = connection.new_event_queue();
         let qh = queue.handle();
@@ -279,10 +304,19 @@ impl Client {
         self.globals.layer_shell_v1().destroy();
         queue.blocking_dispatch(&mut self).unwrap();
 
+        let connection_shared = connection;
+
         let mut client = self.clone();
+        let connection = connection_shared.clone();
         let wayland = async move {
             loop {
-                queue.flush().unwrap();
+                let dispatched = queue.dispatch_pending(&mut client).unwrap();
+                if dispatched > 0 {
+                    continue;
+                }
+
+                connection.flush().unwrap();
+
                 if let Some(guard) = connection.prepare_read() {
                     let _ = AsyncFd::new(guard.connection_fd())
                         .unwrap()
@@ -290,22 +324,34 @@ impl Client {
                         .await
                         .unwrap();
                     _ = guard.read();
-
-                    queue.dispatch_pending(&mut client).unwrap();
                 }
+
+                queue.dispatch_pending(&mut client).unwrap();
             }
         };
 
+        let connection = connection_shared;
+        let mut client = self.clone();
         let timeout = async move {
             let mut timer = tokio::time::interval(Duration::from_hours(24));
             loop {
-                self.tick().await;
                 timer.tick().await;
+                client.on_tick().await;
+                connection.flush().unwrap();
+            }
+        };
+
+        let client = self;
+        let release_source = async move {
+            loop {
+                release_source_msg.recv().await;
+                tokio::time::sleep(Duration::new(10, 0)).await;
+                *client.source.lock().await = None;
             }
         };
 
         async {
-            tokio::join!(timeout, wayland);
+            tokio::join!(timeout, wayland, release_source);
         }
     }
 }
@@ -557,11 +603,12 @@ fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Warn)
         .init();
-    let client = Client::new();
+    let (sender, receiver) = mpsc::channel(1);
+    let client = Client::new(sender);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
         .build()
         .unwrap();
-    runtime.block_on(client.run());
+    runtime.block_on(client.run(receiver));
 }
