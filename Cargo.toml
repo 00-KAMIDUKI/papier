@@ -17,6 +17,7 @@ tokio = { version = "1", default-features = false, features = [
   "sync",
   "time",
   "macros",
+  "parking_lot",
 ] }
 wayland-client = { version = "*", default-features = false }
 wayland-protocols = { version = "*", default-features = false, features = [

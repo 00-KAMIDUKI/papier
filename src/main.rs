@@ -5,6 +5,7 @@ use std::{
     io::{BufReader, Cursor},
     os::fd::AsFd as _,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,7 +16,7 @@ use rustix::{
     fs::{Mode, OFlags},
     mm::{MapFlags, ProtFlags},
 };
-use tokio::{io::unix::AsyncFd, sync::mpsc};
+use tokio::io::unix::AsyncFd;
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
     protocol::{
@@ -40,8 +41,9 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 const APP_NAME: &str = "papier";
 
+#[derive(Clone)]
 struct Client {
-    cache_path: PathBuf,
+    cache_path: Arc<PathBuf>,
     globals: Globals,
     window: Option<Window>,
     cursor_shape_device: Option<WpCursorShapeDeviceV1>,
@@ -71,7 +73,7 @@ impl Client {
         let cache_path = cache_path();
         let source = open_cache(&cache_path).ok();
         Self {
-            cache_path,
+            cache_path: Arc::new(cache_path),
             globals: Globals::default(),
             window: None,
             cursor_shape_device: None,
@@ -91,6 +93,7 @@ impl Client {
     }
 }
 
+#[derive(Clone)]
 struct Window {
     surface: WlSurface,
     pixmap: Pixmap,
@@ -211,36 +214,41 @@ fn decode_image(bytes: Bytes) -> anyhow::Result<DynamicImage> {
     Ok(img)
 }
 
-impl Client {
-    fn fetch(&self, retry: usize) -> impl Future<Output = anyhow::Result<DynamicImage>> {
-        Box::pin(async move {
-            if retry == 0 {
-                anyhow::bail!("failed to fetch image");
-            }
-            match try_fetch().await {
-                Ok(bytes) => match decode_image(bytes.clone()) {
-                    Ok(img) => {
-                        fs::create_dir_all(self.cache_path.parent().unwrap())
-                            .and_then(|_| fs::write(&self.cache_path, bytes))
-                            .inspect_err(|e| log::warn!("failed to cache image: {e:?}"))
-                            .ok();
-                        Ok(img)
-                    }
-                    Err(_) => self.fetch(retry - 1).await,
-                },
-                Err(e) => {
-                    log::warn!("{e:?}");
-                    tokio::time::sleep(Duration::new(1, 0)).await;
-                    self.fetch(retry - 1).await
+fn fetch(
+    cache_path: impl AsRef<Path>,
+    retry: usize,
+) -> impl Future<Output = anyhow::Result<DynamicImage>> {
+    Box::pin(async move {
+        let cache_path = cache_path.as_ref();
+        if retry == 0 {
+            anyhow::bail!("failed to fetch image");
+        }
+        match try_fetch().await {
+            Ok(bytes) => match decode_image(bytes.clone()) {
+                Ok(img) => {
+                    fs::create_dir_all(cache_path.parent().unwrap())
+                        .and_then(|_| fs::write(cache_path, bytes))
+                        .inspect_err(|e| log::warn!("failed to cache image: {e:?}"))
+                        .ok();
+                    Ok(img)
                 }
+                Err(_) => fetch(cache_path, retry - 1).await,
+            },
+            Err(e) => {
+                log::warn!("{e:?}");
+                tokio::time::sleep(Duration::new(1, 0)).await;
+                fetch(cache_path, retry - 1).await
             }
-        })
-    }
+        }
+    })
+}
+
+impl Client {
     fn reload(&self) {
         self.window.as_ref().unwrap().render(&self.source);
     }
     async fn tick(&mut self) {
-        match self.fetch(10).await {
+        match fetch(self.cache_path.as_ref(), 10).await {
             Ok(image) => {
                 self.source = Some(image);
                 self.reload();
@@ -248,13 +256,13 @@ impl Client {
             Err(err) => log::error!("{err:?}"),
         };
     }
-    fn run(&mut self) -> impl Future<Output = ()> {
+    fn run(mut self) -> impl Future<Output = ()> {
         let connection = Connection::connect_to_env().unwrap();
         let mut queue = connection.new_event_queue();
         let qh = queue.handle();
         let display = connection.display();
         display.get_registry(&qh, ());
-        queue.roundtrip(self).unwrap();
+        queue.roundtrip(&mut self).unwrap();
 
         self.window = Some(Window::new(
             self.globals.compositor(),
@@ -262,48 +270,35 @@ impl Client {
             &qh,
         ));
         self.globals.layer_shell_v1().destroy();
-        queue.blocking_dispatch(self).unwrap();
+        queue.blocking_dispatch(&mut self).unwrap();
 
-        let (tick_sender, mut tick) = mpsc::channel(1);
-
-        let ping = async move {
+        let mut client = self.clone();
+        let wayland = async move {
             loop {
-                tick_sender.send(()).await.unwrap();
-                tokio::time::sleep(Duration::from_hours(24)).await;
-            }
-        };
-        let consumer = async move {
-            loop {
-                let dispatched = queue.dispatch_pending(self).unwrap();
-                if dispatched > 0 {
-                    continue;
-                }
+                queue.flush().unwrap();
+                if let Some(guard) = connection.prepare_read() {
+                    let _ = AsyncFd::new(guard.connection_fd())
+                        .unwrap()
+                        .readable()
+                        .await
+                        .unwrap();
+                    _ = guard.read();
 
-                connection.flush().unwrap();
-
-                let wayland = async {
-                    if let Some(guard) = connection.prepare_read() {
-                        let _ = AsyncFd::new(guard.connection_fd())
-                            .unwrap()
-                            .readable()
-                            .await
-                            .unwrap();
-                        _ = guard.read();
-                    }
-                };
-
-                tokio::select! {
-                    _ = tick.recv() => {
-                        self.tick().await;
-                    },
-                    _ = wayland => {
-                        queue.dispatch_pending(self).unwrap();
-                    },
+                    queue.dispatch_pending(&mut client).unwrap();
                 }
             }
         };
+
+        let timeout = async move {
+            let mut timer = tokio::time::interval(Duration::from_hours(24));
+            loop {
+                self.tick().await;
+                timer.tick().await;
+            }
+        };
+
         async {
-            tokio::join!(consumer, ping);
+            tokio::join!(timeout, wayland);
         }
     }
 }
@@ -409,7 +404,6 @@ impl Dispatch<WlSeat, ()> for Client {
                             .get_pointer(&pointer, &qh, ()),
                     );
                     client.globals.cursor_shaper_manager().destroy();
-                    // seat.release();
                 }
             }
             _ => {}
@@ -451,7 +445,7 @@ macro_rules! use_globals {
     (get_version inherit, $version:expr) => { $version };
     (get_version $version: expr, $($dummy:expr)?) => { $version };
     ($(@$interface: ident ($version: tt) $vis: vis $name: ident: $type: ty),* $(,)?) => {
-        #[derive(Default)]
+        #[derive(Default, Clone)]
         struct Globals {
             $($name: Option<$type>),*
         }
@@ -556,7 +550,7 @@ fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Warn)
         .init();
-    let mut client = Client::new();
+    let client = Client::new();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
