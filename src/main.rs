@@ -16,7 +16,7 @@ use rustix::{
     fs::{Mode, OFlags},
     mm::{MapFlags, ProtFlags},
 };
-use tokio::io::unix::AsyncFd;
+use tokio::{io::unix::AsyncFd, sync::Mutex};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
     protocol::{
@@ -40,6 +40,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 
 const APP_NAME: &str = "papier";
+const SHM_PATH: &CStr = c"/dev/shm/papier";
 
 #[derive(Clone)]
 struct Client {
@@ -82,12 +83,15 @@ impl Client {
     }
     fn scale(&mut self, scale: u32, qh: &QueueHandle<Self>) {
         let window = self.window.as_mut().unwrap();
-        if scale == window.pixmap.scale {
-            return;
+        {
+            let mut pixmap = window.pixmap.try_lock().unwrap();
+            if scale == pixmap.scale {
+                return;
+            }
+            window.surface.set_buffer_scale(scale as _);
+            pixmap.unmap();
+            pixmap.scale = scale;
         }
-        window.surface.set_buffer_scale(scale as _);
-        window.pixmap.unmap();
-        window.pixmap.scale = scale;
         window.allocate_buffer(self.globals.shm(), qh);
         self.reload();
     }
@@ -96,7 +100,7 @@ impl Client {
 #[derive(Clone)]
 struct Window {
     surface: WlSurface,
-    pixmap: Pixmap,
+    pixmap: Arc<Mutex<Pixmap>>,
     buffer: Option<WlBuffer>,
 }
 impl Window {
@@ -120,30 +124,33 @@ impl Window {
 
         Window {
             surface,
-            pixmap: Pixmap::default(),
+            pixmap: Default::default(),
             buffer: None,
         }
     }
     fn configure(&mut self, width: u32, height: u32, shm: &WlShm, qh: &QueueHandle<Client>) {
-        self.pixmap.unmap();
-        self.pixmap.width = width;
-        self.pixmap.height = height;
+        {
+            let mut pixmap = self.pixmap.try_lock().unwrap();
+            pixmap.unmap();
+            pixmap.width = width;
+            pixmap.height = height;
+        }
         self.allocate_buffer(shm, qh);
     }
     fn allocate_buffer(&mut self, shm: &WlShm, qh: &QueueHandle<Client>) {
-        const PATH: &CStr = c"/dev/shm/bar";
         let fd = rustix::fs::open(
-            PATH,
+            SHM_PATH,
             OFlags::CREATE | OFlags::RDWR,
             Mode::from_raw_mode(0o600),
         )
         .unwrap();
 
-        rustix::fs::ftruncate(&fd, self.pixmap.byte_size() as _).unwrap();
+        let mut pixmap = self.pixmap.try_lock().unwrap();
+        rustix::fs::ftruncate(&fd, pixmap.byte_size() as _).unwrap();
         let data = unsafe {
             rustix::mm::mmap(
                 std::ptr::null_mut(),
-                self.pixmap.byte_size() as _,
+                pixmap.byte_size() as _,
                 ProtFlags::READ | ProtFlags::WRITE,
                 MapFlags::SHARED,
                 &fd,
@@ -152,48 +159,48 @@ impl Window {
             .unwrap()
         };
         let data = NonNull::new(data as _);
-        rustix::fs::unlink(PATH).unwrap();
+        rustix::fs::unlink(SHM_PATH).unwrap();
 
-        let pool = shm.create_pool(fd.as_fd(), self.pixmap.byte_size() as _, qh, ());
+        let pool = shm.create_pool(fd.as_fd(), pixmap.byte_size() as _, qh, ());
         let buffer = pool.create_buffer(
             0,
-            self.pixmap.buffer_width() as _,
-            self.pixmap.buffer_height() as _,
-            self.pixmap.buffer_stride() as _,
+            pixmap.buffer_width() as _,
+            pixmap.buffer_height() as _,
+            pixmap.buffer_stride() as _,
             Format::Xrgb8888,
             qh,
             (),
         );
         pool.destroy();
 
-        self.pixmap.data = data;
+        pixmap.data = data;
         self.buffer.replace(buffer).as_ref().map(WlBuffer::destroy);
     }
 
     fn render(&self, source: &Option<DynamicImage>) {
-        if let Some(source) = source {
-            for y in 0..self.pixmap.buffer_height() {
-                for x in 0..self.pixmap.buffer_width() {
-                    let dest = self.pixmap.pixel_mut(x, y);
-                    let x = x * source.width() / self.pixmap.buffer_width();
-                    let y = y * source.height() / self.pixmap.buffer_height();
-                    let [r, g, b, _] = source.get_pixel(x, y).0.map(|x| x as u32);
-                    *dest = (r << 16) | (g << 8) | b;
+        let [width, height] = {
+            let pixmap = self.pixmap.try_lock().unwrap();
+            let (width, height) = (pixmap.buffer_width(), pixmap.buffer_height());
+            if let Some(source) = source {
+                for y in 0..height {
+                    for x in 0..width {
+                        let dest = pixmap.pixel_mut(x, y);
+                        let x = x * source.width() / width;
+                        let y = y * source.height() / height;
+                        let [r, g, b, _] = source.get_pixel(x, y).0.map(|x| x as u32);
+                        *dest = (r << 16) | (g << 8) | b;
+                    }
+                }
+            } else {
+                for pixel in pixmap.pixels_mut() {
+                    *pixel = 0x93a7c9;
                 }
             }
-        } else {
-            for pixel in self.pixmap.pixels_mut() {
-                *pixel = 0x93a7c9;
-            }
-        }
+            [width, height].map(|x| x as _)
+        };
         self.surface
             .attach(Some(self.buffer.as_ref().unwrap()), 0, 0);
-        self.surface.damage_buffer(
-            0,
-            0,
-            self.pixmap.buffer_width() as _,
-            self.pixmap.buffer_height() as _,
-        );
+        self.surface.damage_buffer(0, 0, width, height);
         self.surface.commit();
     }
 }
