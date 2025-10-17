@@ -1,3 +1,5 @@
+cargo-features = ["profile-rustflags"]
+
 [package]
 name = "papier"
 version = "0.1.0"
@@ -32,3 +34,9 @@ wayland-protocols = { version = "*", default-features = false, features = [
 wayland-protocols-wlr = { version = "*", default-features = false, features = [
   "client",
 ] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+rustflags = [ "-Ctarget-cpu=native" ]
