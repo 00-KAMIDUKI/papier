@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Context as _;
 use bytes::Bytes;
+use chrono::{DateTime, Days, Local, NaiveTime};
 use image::{DynamicImage, GenericImageView, codecs::jpeg::JpegDecoder};
 use rustix::{
     fs::{Mode, OFlags},
@@ -22,6 +23,7 @@ use tokio::{
         Mutex,
         mpsc::{self, Receiver, Sender},
     },
+    time::MissedTickBehavior,
 };
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
@@ -56,6 +58,7 @@ struct Client {
     cursor_shape_device: Option<WpCursorShapeDeviceV1>,
     source: Arc<Mutex<Option<DynamicImage>>>,
     release_source: Sender<()>,
+    next_fetch: DateTime<Local>,
 }
 
 fn cache_path() -> PathBuf {
@@ -79,9 +82,13 @@ impl Client {
             cursor_shape_device: None,
             source: Default::default(),
             release_source,
+            next_fetch: Local::now(),
         }
     }
     fn scale(&mut self, scale: u32, qh: &QueueHandle<Self>) {
+        if Local::now() <= self.next_fetch {
+            return;
+        }
         let window = self.window.as_mut().unwrap();
         {
             let mut pixmap = window.pixmap.try_lock().unwrap();
@@ -94,6 +101,12 @@ impl Client {
         }
         window.allocate_buffer(self.globals.shm(), qh);
         self.reload();
+        self.next_fetch = self
+            .next_fetch
+            .with_time(NaiveTime::default())
+            .unwrap()
+            .checked_add_days(Days::new(1))
+            .unwrap();
     }
 }
 
@@ -214,7 +227,7 @@ impl Window {
 }
 
 async fn try_fetch() -> anyhow::Result<Bytes> {
-    reqwest::get("https://bing.biturl.top?format=image&resolution=UHD&mkt=random")
+    reqwest::get("https://bing.biturl.top?format=image&resolution=UHD")
         .await
         .context("Failed to reload image")?
         .bytes()
@@ -333,7 +346,8 @@ impl Client {
         let connection = connection_shared;
         let mut client = self.clone();
         let timeout = async move {
-            let mut timer = tokio::time::interval(Duration::from_hours(24));
+            let mut timer = tokio::time::interval(Duration::from_hours(1));
+            timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 timer.tick().await;
                 client.on_tick().await;

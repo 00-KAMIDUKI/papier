@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.100"
-bytes = { version = "1.10.1", default-features = false }
-env_logger = "0.11.8"
+anyhow = "1"
+bytes = { version = "1.10", default-features = false }
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "now",
+] }
+env_logger = "0.11"
 image = { version = "0", default-features = false, features = ["jpeg"] }
-log = "0.4.28"
+log = "0.4"
 reqwest = "0"
 rustix = { version = "1", default-features = false, features = ["mm", "std"] }
 tokio = { version = "1", default-features = false, features = [
